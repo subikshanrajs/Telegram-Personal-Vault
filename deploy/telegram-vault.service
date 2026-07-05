@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram File Vault Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-file-vault
+ExecStart=/home/ubuntu/telegram-file-vault/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ubuntu/telegram-file-vault/.env
+
+[Install]
+WantedBy=multi-user.target

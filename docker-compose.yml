@@ -1,0 +1,30 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+    # Only exposed to other containers on this compose network, not the host/internet
+    expose:
+      - "8081"
+
+  vault-bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      CHANNEL_ID: ${CHANNEL_ID}
+      OWNER_ID: ${OWNER_ID}
+      LOCAL_API_URL: http://telegram-bot-api:8081
+      DB_PATH: /app/data/vault.db
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  bot-api-data:
