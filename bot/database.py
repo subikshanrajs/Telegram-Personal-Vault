@@ -7,21 +7,30 @@ from datetime import datetime, timezone
 from .config import DB_PATH, OWNER_ID
 
 # --- Series/episode auto-grouping ------------------------------------------------
-# Heuristic: strip common episode/quality markers from a filename to derive a
-# shared "collection" key so e.g. "Show.S01E01.mkv" and "Show.S01E02.mkv" group
-# together. Imperfect by nature — override any file's grouping with /collection.
+# Heuristic: strip common episode/quality/release-tag markers from a filename to
+# derive a shared "collection" key so related files group together. Imperfect by
+# nature — use /collection, /bulkcollection, /mergecollections, or /regroup to fix.
 
 _EPISODE_PATTERNS = [
     r"\bS\d{1,2}E\d{1,3}\b",
     r"\bSeason\s*\d{1,3}\b",
     r"\bEp(?:isode)?\.?\s*\d{1,4}\b",
     r"\bE\d{1,4}\b",
+    r"\b\d{1,2}x\d{1,3}\b",
     r"\bPart\s*\d{1,3}\b",
+    r"\bChapter\s*\d{1,4}\b",
+    r"\bVol(?:ume)?\.?\s*\d{1,4}\b",
+    r"\bCD\s*\d{1,3}\b",
+    r"\bDisc\s*\d{1,3}\b",
+    r"\bTrack\s*\d{1,4}\b",
     r"\b\d{1,3}\s*of\s*\d{1,3}\b",
     r"\(\d{4}\)",
     r"\[\d{4}\]",
     r"\b\d{3,4}p\b",
-    r"\b(x264|x265|HEVC|WEBRip|WEB-DL|BluRay|HDRip|HDTV)\b",
+    r"\b(?:x264|x265|h\.?264|h\.?265|hevc|av1|xvid|divx)\b",
+    r"\b(?:webrip|web-?dl|bluray|brrip|bdrip|hdrip|camrip|dvdrip|dvdscr|hdtv|hdcam|pdtv)\b",
+    r"\b(?:aac|ac3|dts|flac|mp3|dd5\.1|5\.1|2\.0)\b",
+    r"\b(?:dual audio|multi audio|dubbed|subbed)\b",
 ]
 
 
@@ -29,23 +38,49 @@ def derive_collection(file_name: str):
     base = os.path.splitext(file_name)[0]
     cleaned = base
     matched = False
+
     for pat in _EPISODE_PATTERNS:
         cleaned, n = re.subn(pat, " ", cleaned, flags=re.IGNORECASE)
         if n:
             matched = True
+
+    # Strip leftover bracket/paren "noise" tags (release group, language, etc.)
+    cleaned, n = re.subn(r"\[[^\[\]]{0,40}\]", " ", cleaned)
+    matched = matched or bool(n)
+    cleaned, n = re.subn(r"\([^()]{0,40}\)", " ", cleaned)
+    matched = matched or bool(n)
+
     cleaned = re.sub(r"[._]+", " ", cleaned)
     cleaned = re.sub(r"[\-\s]{2,}", " ", cleaned)
     # strip a lone trailing number left over from naive "Name 1", "Name 2" naming
-    cleaned, n2 = re.subn(r"\s+\d{1,3}\s*$", "", cleaned)
-    if n2:
-        matched = True
+    cleaned, n = re.subn(r"\s+\d{1,3}\s*$", "", cleaned)
+    matched = matched or bool(n)
     cleaned = cleaned.strip(" -_.")
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+
     # Only call it a collection if we actually found episode/sequence evidence —
     # otherwise every one-off file would form a "collection of one".
     if not matched or len(cleaned) < 3:
         return None
     return cleaned
+
+
+def parse_id_spec(spec: str):
+    """Parses '5', '120-150', or '5,7,9-12' into a sorted list of unique ints."""
+    ids = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            ids.update(range(a, b + 1))
+        else:
+            ids.add(int(token))
+    return sorted(ids)
 
 
 def _ensure_column(conn, table, column, coldef):
@@ -64,6 +99,19 @@ def _get_or_create_collection(conn, name):
         return row[0]
     cur = conn.execute("INSERT INTO collections (name) VALUES (?)", (name,))
     return cur.lastrowid
+
+
+def _cleanup_empty_collections(conn=None):
+    def _run(c):
+        c.execute(
+            "DELETE FROM collections WHERE id NOT IN "
+            "(SELECT DISTINCT collection_id FROM files WHERE collection_id IS NOT NULL)"
+        )
+    if conn is not None:
+        _run(conn)
+    else:
+        with get_conn() as c:
+            _run(c)
 
 
 def init_db():
@@ -100,11 +148,13 @@ def init_db():
             tags TEXT,
             uploaded_by INTEGER,
             upload_date TEXT NOT NULL,
-            collection_id INTEGER REFERENCES collections(id)
+            collection_id INTEGER REFERENCES collections(id),
+            collection_manual INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     _ensure_column(conn, "files", "collection_id", "INTEGER REFERENCES collections(id)")
+    _ensure_column(conn, "files", "collection_manual", "INTEGER NOT NULL DEFAULT 0")
 
     conn.execute(
         """
@@ -124,7 +174,7 @@ def init_db():
     conn.execute("UPDATE allowed_users SET is_owner = 1 WHERE user_id = ?", (OWNER_ID,))
 
     version_row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-    version = int(version_row[0]) if version_row else (1 if files_table_existed else 2)
+    version = int(version_row[0]) if version_row else (1 if files_table_existed else 3)
 
     if version < 2:
         conn.execute("DROP TRIGGER IF EXISTS files_ai")
@@ -138,7 +188,6 @@ def init_db():
             )
             """
         )
-        # Backfill collections for rows that predate this feature
         for rid, fname in conn.execute(
             "SELECT id, file_name FROM files WHERE collection_id IS NULL"
         ).fetchall():
@@ -152,10 +201,6 @@ def init_db():
             FROM files f LEFT JOIN collections c ON c.id = f.collection_id
             """
         )
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '2') "
-            "ON CONFLICT(key) DO UPDATE SET value = '2'"
-        )
     else:
         conn.execute(
             """
@@ -164,6 +209,13 @@ def init_db():
             )
             """
         )
+
+    # v3 is purely additive (collection_manual column, already ensured above) —
+    # nothing else to migrate, just bump the version stamp.
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '3') "
+        "ON CONFLICT(key) DO UPDATE SET value = '3'"
+    )
 
     conn.execute(
         """
@@ -231,7 +283,13 @@ def add_file(file_name, file_type, file_size, telegram_file_id, telegram_unique_
              channel_message_id, caption, tags, uploaded_by,
              datetime.now(timezone.utc).isoformat(), collection_id),
         )
-        return cur.lastrowid, collection_name
+        record_id = cur.lastrowid
+        member_count = 0
+        if collection_id:
+            member_count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE collection_id = ?", (collection_id,)
+            ).fetchone()[0]
+        return record_id, collection_name, member_count
 
 
 def get_file(file_id):
@@ -243,6 +301,7 @@ def get_file(file_id):
 def delete_file(file_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    _cleanup_empty_collections()
 
 
 def rename_file(file_id, new_name):
@@ -253,7 +312,86 @@ def rename_file(file_id, new_name):
 def set_file_collection(file_id, name):
     with get_conn() as conn:
         cid = _get_or_create_collection(conn, name) if name else None
-        conn.execute("UPDATE files SET collection_id = ? WHERE id = ?", (cid, file_id))
+        conn.execute(
+            "UPDATE files SET collection_id = ?, collection_manual = 1 WHERE id = ?",
+            (cid, file_id),
+        )
+    _cleanup_empty_collections()
+
+
+def bulk_set_collection(file_ids, name):
+    with get_conn() as conn:
+        cid = _get_or_create_collection(conn, name) if name else None
+        updated = 0
+        for fid in file_ids:
+            cur = conn.execute(
+                "UPDATE files SET collection_id = ?, collection_manual = 1 WHERE id = ?",
+                (cid, fid),
+            )
+            updated += cur.rowcount
+    _cleanup_empty_collections()
+    return updated
+
+
+def merge_collections(target_id, source_ids):
+    source_ids = [sid for sid in source_ids if sid != target_id]
+    with get_conn() as conn:
+        target_row = conn.execute(
+            "SELECT name FROM collections WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not target_row:
+            return None, 0
+        moved = 0
+        for sid in source_ids:
+            cur = conn.execute(
+                "UPDATE files SET collection_id = ?, collection_manual = 1 WHERE collection_id = ?",
+                (target_id, sid),
+            )
+            moved += cur.rowcount
+    _cleanup_empty_collections()
+    return target_row[0], moved
+
+
+def rename_collection(collection_id, new_name):
+    with get_conn() as conn:
+        exists = conn.execute("SELECT id FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        if not exists:
+            return False
+        try:
+            conn.execute("UPDATE collections SET name = ? WHERE id = ?", (new_name, collection_id))
+        except sqlite3.IntegrityError:
+            # A collection with that name already exists (case-insensitive) — merge instead.
+            existing = conn.execute(
+                "SELECT id FROM collections WHERE name = ? COLLATE NOCASE", (new_name,)
+            ).fetchone()
+            if existing and existing[0] != collection_id:
+                conn.execute(
+                    "UPDATE files SET collection_id = ? WHERE collection_id = ?",
+                    (existing[0], collection_id),
+                )
+                conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        return True
+
+
+def regroup_auto():
+    """Re-derives collections for every file that was auto-grouped (never manually
+    touched), using the current algorithm. Manually-fixed files are left alone."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, file_name, collection_id FROM files WHERE collection_manual = 0"
+        ).fetchall()
+        changed = 0
+        cleared = 0
+        for rid, fname, old_cid in rows:
+            new_name = derive_collection(fname)
+            new_cid = _get_or_create_collection(conn, new_name) if new_name else None
+            if new_cid != old_cid:
+                conn.execute("UPDATE files SET collection_id = ? WHERE id = ?", (new_cid, rid))
+                changed += 1
+                if new_cid is None:
+                    cleared += 1
+    _cleanup_empty_collections()
+    return len(rows), changed, cleared
 
 
 def list_files(page=0, page_size=10):
@@ -266,9 +404,18 @@ def list_files(page=0, page_size=10):
         return [dict(r) for r in rows], total
 
 
+def list_uncollected(page=0, page_size=10):
+    offset = page * page_size
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM files WHERE collection_id IS NULL ORDER BY id DESC LIMIT ? OFFSET ?",
+            (page_size, offset),
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM files WHERE collection_id IS NULL").fetchone()[0]
+        return [dict(r) for r in rows], total
+
+
 def search_grouped(query, page=0, page_size=10):
-    """Search by filename or collection name; episodes sharing a collection are
-    folded into a single group entry instead of N separate results."""
     fts_query = " ".join(f"{tok}*" for tok in query.split() if tok)
     with get_conn() as conn:
         try:
@@ -359,6 +506,22 @@ def list_collections(page=0, page_size=10):
         return [dict(r) for r in rows], total
 
 
+def find_duplicates():
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT telegram_unique_id, COUNT(*) AS cnt, GROUP_CONCAT(id) AS ids,
+                   MIN(file_name) AS sample_name
+            FROM files
+            WHERE telegram_unique_id IS NOT NULL AND telegram_unique_id != ''
+            GROUP BY telegram_unique_id
+            HAVING cnt > 1
+            ORDER BY cnt DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def all_files():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM files ORDER BY id ASC").fetchall()
@@ -386,9 +549,7 @@ def stats():
 
 def is_allowed(user_id):
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        row = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)).fetchone()
         return row is not None
 
 

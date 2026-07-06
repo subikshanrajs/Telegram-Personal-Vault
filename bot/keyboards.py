@@ -75,7 +75,7 @@ def grouped_results_keyboard(items, page, pages, query):
 
 def collections_keyboard(rows, page, pages):
     buttons = [
-        [InlineKeyboardButton(f"🎬 {r['name']} ({r['cnt']})", callback_data=f"collbrowse:{r['id']}:0")]
+        [InlineKeyboardButton(f"🎬 #{r['id']} {r['name']} ({r['cnt']})", callback_data=f"collbrowse:{r['id']}:0")]
         for r in rows
     ]
     nav = []
@@ -85,6 +85,23 @@ def collections_keyboard(rows, page, pages):
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
     if page < pages - 1:
         nav.append(InlineKeyboardButton("▶️", callback_data=f"collpage:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    return InlineKeyboardMarkup(buttons)
+
+
+def uncollected_keyboard(rows, page, pages):
+    buttons = [
+        [InlineKeyboardButton(f"📄 #{r['id']} {r['file_name']}", callback_data=f"get:{r['id']}")]
+        for r in rows
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"ucpage:{page - 1}"))
+    if pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"ucpage:{page + 1}"))
     if nav:
         buttons.append(nav)
     return InlineKeyboardMarkup(buttons)

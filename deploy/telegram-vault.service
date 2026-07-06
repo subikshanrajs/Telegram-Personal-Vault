@@ -14,3 +14,4 @@ EnvironmentFile=/home/ubuntu/telegram-file-vault/.env
 
 [Install]
 WantedBy=multi-user.target
+

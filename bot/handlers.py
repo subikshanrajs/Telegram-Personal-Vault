@@ -2,7 +2,7 @@ import asyncio
 import logging
 import math
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -21,11 +21,12 @@ from .keyboards import (
     grouped_results_keyboard,
     main_menu_keyboard,
     results_keyboard,
+    uncollected_keyboard,
 )
 
 logger = logging.getLogger(__name__)
 
-SEND_DELAY = 0.35  # seconds between messages during bulk sends, to stay clear of flood limits
+SEND_DELAY = 0.35  # seconds between messages during bulk sends, on top of the rate limiter
 
 
 def human_size(n):
@@ -49,7 +50,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use the buttons below, or these commands:\n"
         "/search <name> — search by filename or series\n"
         "/collections — browse auto-grouped series\n"
-        "/collection <id> <name> — fix a file's grouping manually\n"
+        "/collection <id> <name> — fix one file's grouping\n"
+        "/bulkcollection <ids> <name> — group a range at once (e.g. `120-150`)\n"
+        "/mergecollections <id> <id2>… — merge collections together\n"
+        "/renamecollection <id> <name> — rename a whole series\n"
+        "/regroup — re-run the grouping algorithm on everything you haven't fixed manually\n"
+        "/uncollected — files not in any series\n"
+        "/duplicates — find files uploaded more than once\n"
         "/rename <id> <new name> — rename an entry\n"
         "/delete <id> — remove an entry\n"
         "/stats — storage summary\n"
@@ -95,15 +102,27 @@ async def save_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    copied = await context.bot.copy_message(
-        chat_id=CHANNEL_ID,
-        from_chat_id=msg.chat_id,
-        message_id=msg.message_id,
-    )
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=CHANNEL_ID,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+        )
+    except Exception as e:
+        # The rate limiter already retries transparently; if we still land here,
+        # Telegram genuinely rejected it — tell the user instead of losing the file silently.
+        logger.exception("Failed to archive incoming file: %s", default_name)
+        await msg.reply_text(
+            f"⚠️ Failed to archive `{default_name}` ({type(e).__name__}). "
+            "If you're uploading a big batch, Telegram may still be catching up — "
+            "wait a bit and resend just this one file.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     file_size = getattr(file_obj, "file_size", None)
 
-    record_id, collection_name = db.add_file(
+    record_id, collection_name, member_count = db.add_file(
         file_name=default_name,
         file_type=file_type,
         file_size=file_size,
@@ -114,12 +133,16 @@ async def save_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uploaded_by=update.effective_user.id,
     )
 
-    series_line = f"\nSeries: *{collection_name}*" if collection_name else ""
+    # Only mention a series if this file actually joined an existing group —
+    # otherwise every one-off upload would show a noisy "Series: X" of its own.
+    series_line = ""
+    if collection_name and member_count and member_count > 1:
+        series_line = f"\nSeries: *{collection_name}* ({member_count} files)"
+
     await msg.reply_text(
         f"✅ Archived as *#{record_id}* — `{default_name}`\n"
         f"Type: {file_type} · Size: {human_size(file_size)}{series_line}\n\n"
-        f"Rename: `/rename {record_id} new_name.ext`"
-        + (f"\nFix grouping: `/collection {record_id} Correct Series Name`" if collection_name else ""),
+        f"Rename: `/rename {record_id} new_name.ext`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -139,6 +162,20 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pages = max(1, math.ceil(total / PAGE_SIZE))
     header = f"Results {page * PAGE_SIZE + 1}-{page * PAGE_SIZE + len(rows)} of {total}:"
     await update.effective_message.reply_text(header, reply_markup=results_keyboard(rows, page, pages, None))
+
+
+@allowed_only
+async def uncollected_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    page = 0
+    if context.args and context.args[0].isdigit():
+        page = max(0, int(context.args[0]) - 1)
+    rows, total = db.list_uncollected(page, PAGE_SIZE)
+    if not rows:
+        await update.effective_message.reply_text("Nothing uncollected — every file is either grouped or standalone by design.")
+        return
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    header = f"Uncollected {page * PAGE_SIZE + 1}-{page * PAGE_SIZE + len(rows)} of {total}:"
+    await update.effective_message.reply_text(header, reply_markup=uncollected_keyboard(rows, page, pages))
 
 
 @allowed_only
@@ -175,7 +212,8 @@ async def collections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pages = max(1, math.ceil(total / PAGE_SIZE))
     await update.effective_message.reply_text(
-        f"{total} series/collections:", reply_markup=collections_keyboard(rows, page, pages)
+        f"{total} series/collections (# is the id for /mergecollections etc.):",
+        reply_markup=collections_keyboard(rows, page, pages),
     )
 
 
@@ -198,6 +236,97 @@ async def set_collection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"#{file_id} added to *{name}*", parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(f"#{file_id} removed from its collection.")
+
+
+@allowed_only
+async def bulkcollection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/bulkcollection <ids> <name>`\n"
+            "ids can be a range (`120-150`), a list (`5,7,9`), or mixed (`1,5-10,15`).\n"
+            "Use `-` as the name to clear grouping for those ids instead.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    spec = context.args[0]
+    name = None if (len(context.args) == 2 and context.args[1] == "-") else " ".join(context.args[1:])
+    try:
+        ids = db.parse_id_spec(spec)
+    except ValueError:
+        await update.message.reply_text(
+            "Couldn't parse that — use formats like `120-150` or `5,7,9-12`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if not ids:
+        await update.message.reply_text("No valid ids in that range.")
+        return
+    updated = db.bulk_set_collection(ids, name)
+    if name:
+        await update.message.reply_text(
+            f"✅ Added {updated} file(s) to *{name}*", parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(f"Removed {updated} file(s) from their collection.")
+
+
+@allowed_only
+async def mergecollections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not all(a.isdigit() for a in context.args):
+        await update.message.reply_text(
+            "Usage: /mergecollections <target_id> <source_id> [<source_id2> ...]\n"
+            "Find ids with /collections. Everything from the source collection(s) "
+            "moves into the target, and the empty source collections disappear."
+        )
+        return
+    target_id = int(context.args[0])
+    source_ids = [int(a) for a in context.args[1:]]
+    name, moved = db.merge_collections(target_id, source_ids)
+    if name is None:
+        await update.message.reply_text("No collection with that target id.")
+        return
+    await update.message.reply_text(
+        f"✅ Merged {moved} file(s) into *{name}* (#{target_id})", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@allowed_only
+async def renamecollection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /renamecollection <collection_id> <new name>")
+        return
+    cid = int(context.args[0])
+    new_name = " ".join(context.args[1:])
+    ok = db.rename_collection(cid, new_name)
+    if not ok:
+        await update.message.reply_text("No collection with that id.")
+        return
+    await update.message.reply_text(f"Renamed collection #{cid} → *{new_name}*", parse_mode=ParseMode.MARKDOWN)
+
+
+@allowed_only
+async def regroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Re-grouping everything you haven't fixed manually…")
+    total, changed, cleared = db.regroup_auto()
+    await update.message.reply_text(
+        f"✅ Checked {total} auto-grouped files — {changed} moved to a different/new group, "
+        f"{cleared} no longer look like part of a series.\n"
+        f"Anything you already fixed with /collection, /bulkcollection, or /mergecollections was left alone."
+    )
+
+
+@allowed_only
+async def duplicates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dupes = db.find_duplicates()
+    if not dupes:
+        await update.message.reply_text("No duplicate uploads found.")
+        return
+    lines = [f"🔁 {len(dupes)} set(s) of duplicate files:"]
+    for d in dupes[:30]:
+        lines.append(f"  `{d['sample_name']}` — ids {d['ids']} ({d['cnt']}x)")
+    if len(dupes) > 30:
+        lines.append(f"  …and {len(dupes) - 30} more")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # --- Bulk "get everything" ------------------------------------------------------
@@ -296,7 +425,7 @@ async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ You've been granted access to the File Vault bot. Send /start to begin.",
         )
     except Exception:
-        pass  # they may not have messaged the bot yet — fine, they'll see it on /start
+        pass
 
 
 @owner_only
@@ -371,10 +500,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("page:"):
         _, kind, q, p = data.split(":", 3)
         page = int(p)
-        q = None if q == "-" else q
         rows, total = db.list_files(page, PAGE_SIZE)
         pages = max(1, math.ceil(total / PAGE_SIZE))
         await query.edit_message_reply_markup(reply_markup=results_keyboard(rows, page, pages, None))
+        return
+
+    if data.startswith("ucpage:"):
+        page = int(data.split(":", 1)[1])
+        rows, total = db.list_uncollected(page, PAGE_SIZE)
+        pages = max(1, math.ceil(total / PAGE_SIZE))
+        await query.edit_message_reply_markup(reply_markup=uncollected_keyboard(rows, page, pages))
         return
 
     if data.startswith("gpage:"):
@@ -399,7 +534,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not members:
             await query.message.reply_text("That collection is empty.")
             return
-        text = f"🎬 *{name}* — {len(members)} files"
+        text = f"🎬 *{name}* (#{cid}) — {len(members)} files"
         kb = collection_browse_keyboard(cid, members, page)
         try:
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
